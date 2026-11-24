@@ -17,14 +17,14 @@ Deletion uses the standard macOS administrator password dialog. **The password i
 
 ## Requirements
 
-- macOS 13 or later
+- macOS 13 or later (tested on macOS 27.2)
 - An administrator account (to authorize deletes)
 - Xcode Command Line Tools / Swift toolchain (to build)
 
 ## Build & run
 
 ```bash
-cd ~/SnapClean
+cd "/Users/timbestler/Apps - macOS Utility/SnapClean"
 chmod +x build-app.sh
 ./build-app.sh
 ```
@@ -60,9 +60,13 @@ You can cancel the password dialog; the app reports that as cancelled.
 - Reclaimed space of **0** usually means the deleted snapshot’s blocks were still shared with other snapshots or the live volume.
 - Other apps writing to disk during the measurement can affect the free-space delta slightly.
 - macOS may create new local snapshots again later; that is normal Time Machine behavior.
-- The app never stores your password. Elevation uses macOS Authorization Services for this process only.
+- The app never stores your password. Elevation uses macOS Authorization Services for this process only. macOS 27.2 still provides that API. If a later system removes it, SnapClean asks once per delete through the standard administrator dialog.
+- Backup disks reported by `tmutil destinationinfo`, hidden Time Machine stores under `/Volumes/.timemachine`, and sealed system volumes are not scanned. Only `.local` snapshots on a data volume are deleted. `com.apple.os.update` snapshots are left alone.
 - System policy may still expire rights after a long idle period; the next delete will prompt again.
-- Only validated `YYYY-MM-DD-HHMMSS` date tokens from `tmutil` are ever passed to the delete command.
+- Only validated `YYYY-MM-DD-HHMMSS` date tokens are ever passed to the delete command.
+- A delete runs `tmutil deletelocalsnapshots` for that date. Time Machine’s backupd is what can unmount a protected browse of the snapshot. `diskutil` reports -69528, “busy (mounted)”, for that same browse, including after the folder itself is already gone.
+- That `tmutil` command also visits other mounted disks and often exits with “Device not configured” on Time Machine browse mounts. SnapClean ignores that exit status. The delete succeeded when the snapshot is no longer listed on the APFS volume that stored it.
+- `SnapClean --self-test` prints each snapshot and the disk it would be removed from. It does not delete anything.
 
 ## Project layout
 
@@ -75,5 +79,6 @@ SnapClean/
 └── Sources/SnapClean/
     ├── MainEntry.swift        # AppKit entry + window
     ├── ContentView.swift      # SwiftUI UI
+    ├── PrivilegedSession.swift # Session admin rights
     └── SnapshotService.swift  # List / delete via tmutil
 ```

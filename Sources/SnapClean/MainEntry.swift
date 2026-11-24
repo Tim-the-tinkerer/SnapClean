@@ -4,6 +4,10 @@ import SwiftUI
 @main
 struct MainEntry {
     static func main() {
+        if CommandLine.arguments.contains("--self-test") {
+            exit(SnapshotService.runSelfTest())
+        }
+
         let app = NSApplication.shared
         // NSApplication.delegate is weak — keep a strong reference for the process lifetime.
         let delegate = AppDelegate.shared
@@ -34,6 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        true
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             showMainWindow()
@@ -46,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showMainWindow() {
         if let window {
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            activateApp()
             return
         }
 
@@ -71,8 +79,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.isReleasedWhenClosed = false
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         self.window = window
+    }
+
+    private func activateApp() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     @objc private func forgetAuthorization(_ sender: Any?) {
@@ -81,8 +97,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout(_ sender: Any?) {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "1.2.0"
-        let build = info?["CFBundleVersion"] as? String ?? "3"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "1.2.5"
+        let build = info?["CFBundleVersion"] as? String ?? "8"
         let options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationName: "SnapClean",
             .version: version,
@@ -99,8 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshSnapshots(_ sender: Any?) {
-        // Forward to first responder / key window; ContentView handles ⌘R.
-        NSApp.sendAction(Selector(("reload:")), to: nil, from: sender)
+        NotificationCenter.default.post(name: .snapCleanRefreshRequested, object: nil)
     }
 
     private func buildMainMenu() {
@@ -175,7 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(viewMenuItem)
         let viewMenu = NSMenu(title: "View")
         viewMenuItem.submenu = viewMenu
-        // Refresh is handled by SwiftUI keyboardShortcut on the button.
+        viewMenu.addItem(
+            withTitle: "Refresh Snapshots",
+            action: #selector(refreshSnapshots(_:)),
+            keyEquivalent: "r"
+        )
 
         // Window menu
         let windowMenuItem = NSMenuItem()

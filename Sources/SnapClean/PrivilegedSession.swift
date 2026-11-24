@@ -11,12 +11,20 @@ import Security
 ///
 /// `AuthorizationExecuteWithPrivileges` is deprecated and marked unavailable in
 /// Swift, so it is resolved at runtime via `dlsym` from Security.framework.
+/// macOS 27.2 still exports the symbol from the dyld shared cache. If a later
+/// system removes it, deletes fall back to an administrator `osascript` prompt.
 final class PrivilegedSession {
     static let shared = PrivilegedSession()
 
     private var authRef: AuthorizationRef?
     /// True after a successful interactive authorization this process lifetime.
     private(set) var isAuthorized = false
+
+    /// True when this Mac can elevate with a session `AuthorizationRef`.
+    /// False when the deprecated execute API is gone and each delete must use `osascript`.
+    var canExecuteWithPrivileges: Bool {
+        executeWithPrivileges != nil
+    }
 
     /// C function type for the deprecated execute-with-privileges API.
     private typealias ExecuteWithPrivilegesFn = @convention(c) (
@@ -50,7 +58,11 @@ final class PrivilegedSession {
     private init() {}
 
     deinit {
-        invalidate()
+        if let authRef {
+            AuthorizationFree(authRef, [.destroyRights])
+        }
+        self.authRef = nil
+        isAuthorized = false
     }
 
     /// Drops cached authorization; the next privileged call will prompt again.
@@ -59,7 +71,21 @@ final class PrivilegedSession {
             AuthorizationFree(authRef, [.destroyRights])
         }
         self.authRef = nil
-        isAuthorized = false
+        updateAuthorized(false)
+    }
+
+    private func updateAuthorized(_ newValue: Bool) {
+        let changed = isAuthorized != newValue
+        isAuthorized = newValue
+        guard changed else { return }
+        let post = {
+            NotificationCenter.default.post(name: .snapCleanAuthorizationDidChange, object: nil)
+        }
+        if Thread.isMainThread {
+            post()
+        } else {
+            DispatchQueue.main.async(execute: post)
+        }
     }
 
     enum RunResult: Equatable {
@@ -104,12 +130,12 @@ final class PrivilegedSession {
                 let status = AuthorizationCopyRights(authRef, &rights, nil, flags, nil)
                 switch status {
                 case errAuthorizationSuccess:
-                    isAuthorized = true
+                    updateAuthorized(true)
                     return .success("")
                 case errAuthorizationCanceled:
                     return .cancelled
                 default:
-                    isAuthorized = false
+                    updateAuthorized(false)
                     return .failed(authorizationErrorMessage(status))
                 }
             }
@@ -117,17 +143,24 @@ final class PrivilegedSession {
     }
 
     /// Runs `toolPath` as root with `arguments` (extra argv entries, not including the path).
-    /// Calls ``ensureAuthorized()`` first.
     ///
-    /// **Threading:** Call from the main thread.
-    func run(toolPath: String, arguments: [String]) -> RunResult {
-        switch ensureAuthorized() {
-        case .cancelled:
-            return .cancelled
-        case .failed(let message):
-            return .failed(message)
-        case .success:
-            break
+    /// When `authorize` is true, calls ``ensureAuthorized()`` first. Pass false only
+    /// after a successful ``ensureAuthorized()`` on the main thread.
+    ///
+    /// **Threading:** Authorization UI must be on the main thread. The tool itself
+    /// may run off the main thread once rights are granted.
+    func run(toolPath: String, arguments: [String], authorize: Bool = true) -> RunResult {
+        if authorize {
+            switch ensureAuthorized() {
+            case .cancelled:
+                return .cancelled
+            case .failed(let message):
+                return .failed(message)
+            case .success:
+                break
+            }
+        } else if authRef == nil || !isAuthorized {
+            return .failed("Authorization session is missing.")
         }
 
         guard let authRef else {
@@ -173,13 +206,13 @@ final class PrivilegedSession {
             let output = drain(pipe: pipe)
             return .success(output)
         case errAuthorizationCanceled:
-            isAuthorized = false
+            updateAuthorized(false)
             if let pipe { fclose(pipe) }
             return .cancelled
         default:
             if let pipe { fclose(pipe) }
             if status == errAuthorizationDenied || status == errAuthorizationInvalidRef {
-                isAuthorized = false
+                updateAuthorized(false)
             }
             return .failed(authorizationErrorMessage(status))
         }
@@ -188,12 +221,27 @@ final class PrivilegedSession {
     /// Runs a shell script as root via `/bin/sh -c`.
     /// Script must be fully trusted (caller validates all interpolated tokens).
     /// Appends a success marker so we know the script finished (exit status is not exposed).
-    func runShell(_ script: String) -> RunResult {
+    ///
+    /// Uses the session authorization API when it is available. Otherwise asks
+    /// `osascript` to show the administrator dialog for this one script.
+    func runShell(_ script: String, authorize: Bool = true) -> RunResult {
         let wrapped = """
         \(script)
         echo SNAPCLEAN_OK
         """
-        switch run(toolPath: "/bin/sh", arguments: ["-c", wrapped]) {
+        if executeWithPrivileges != nil {
+            return finish(run(toolPath: "/bin/sh", arguments: ["-c", wrapped], authorize: authorize))
+        }
+        return finish(runViaOsascript(wrapped))
+    }
+
+    /// AppleScript source for the administrator fallback. Exposed so `--self-test` can compile it.
+    func appleScriptSource(for script: String) -> String {
+        "do shell script \"\(appleScriptEscape(script))\" with administrator privileges"
+    }
+
+    private func finish(_ result: RunResult) -> RunResult {
+        switch result {
         case .cancelled:
             return .cancelled
         case .failed(let message):
@@ -208,6 +256,53 @@ final class PrivilegedSession {
             }
             return .failed(trimmed)
         }
+    }
+
+    private func runViaOsascript(_ script: String) -> RunResult {
+        let source = appleScriptSource(for: script)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+        process.standardInput = FileHandle.nullDevice
+
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+
+        do {
+            try process.run()
+        } catch {
+            return .failed("Could not start osascript: \(error.localizedDescription)")
+        }
+        process.waitUntilExit()
+
+        let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let combined = [stderr, stdout]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+
+        if process.terminationStatus == 0 {
+            return .success(stdout)
+        }
+        if combined.contains("(-128)")
+            || combined.lowercased().contains("user canceled")
+            || combined.lowercased().contains("user cancelled")
+        {
+            return .cancelled
+        }
+        if combined.isEmpty {
+            return .failed("osascript exited with status \(process.terminationStatus).")
+        }
+        return .failed(combined)
+    }
+
+    private func appleScriptEscape(_ script: String) -> String {
+        script
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     private func drain(pipe: UnsafeMutablePointer<FILE>?) -> String {
@@ -245,4 +340,9 @@ final class PrivilegedSession {
             return "Authorization failed (error \(status))."
         }
     }
+}
+
+extension Notification.Name {
+    static let snapCleanAuthorizationDidChange = Notification.Name("SnapCleanAuthorizationDidChange")
+    static let snapCleanRefreshRequested = Notification.Name("SnapCleanRefreshRequested")
 }

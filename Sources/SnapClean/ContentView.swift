@@ -57,6 +57,12 @@ struct ContentView: View {
         .frame(minWidth: 520, minHeight: 420)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { reload() }
+        .onReceive(NotificationCenter.default.publisher(for: .snapCleanAuthorizationDidChange)) { _ in
+            sessionAuthorized = SnapshotService.hasSessionAuthorization
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .snapCleanRefreshRequested)) { _ in
+            if !isBusy { reload() }
+        }
         .alert("Delete selected snapshots?", isPresented: $confirmDeleteSelected) {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) {
@@ -217,7 +223,7 @@ struct ContentView: View {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 .disabled(isBusy)
-                .keyboardShortcut("r", modifiers: .command)
+                .help("Refresh the snapshot list (⌘R)")
 
                 if sessionAuthorized {
                     Button {
@@ -302,7 +308,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
 
         case .deleting:
-            Label("Authenticating, then deleting…", systemImage: "hourglass")
+            Label("Deleting snapshots…", systemImage: "hourglass")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -327,7 +333,7 @@ struct ContentView: View {
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
                 .foregroundStyle(.orange)
-                .lineLimit(2)
+                .lineLimit(4)
                 .help(message)
         }
     }
@@ -359,45 +365,95 @@ struct ContentView: View {
         status = .deleting
         lastOutcome = nil
 
-        // NSAppleScript must run on the main thread; defer one turn so SwiftUI paints.
-        DispatchQueue.main.async {
-            let freeBefore = SnapshotService.freeBytes()
-            let result = SnapshotService.deleteSnapshots(dateTokens: tokens)
-            switch result {
-            case .success(let partial):
-                sessionAuthorized = SnapshotService.hasSessionAuthorization
-                status = .measuring
-                selection.removeAll()
-                let deletedCount = partial.deletedCount
-
-                // Sample free space off the main thread (short sleeps while APFS settles).
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let freeAfter = SnapshotService.freeBytesAfterDelete(baseline: freeBefore)
-                    let listResult = SnapshotService.listSnapshots()
-                    let summary = SnapshotService.volumeSummary()
-                    let outcome = SnapshotService.makeOutcome(
-                        deletedCount: deletedCount,
-                        freeBefore: freeBefore,
-                        freeAfter: freeAfter
-                    )
-                    DispatchQueue.main.async {
-                        lastOutcome = outcome
-                        sessionAuthorized = SnapshotService.hasSessionAuthorization
-                        if let reclaimed = outcome.reclaimedBytes, reclaimed > 0 {
-                            sessionFreedBytes += reclaimed
-                        }
-                        volume = summary
-                        snapshots = listResult.snapshots
-                        status = .success(outcome.successMessage)
-                    }
+        // Find the disks first. A bad plan should not ask for a password.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let plan = SnapshotService.deletionPlan(dateTokens: tokens)
+            DispatchQueue.main.async {
+                if let message = plan.error {
+                    status = .failed(message)
+                    return
                 }
+                guard let script = plan.script, let count = plan.deletedCount else {
+                    status = .failed("No snapshots selected.")
+                    return
+                }
+                beginAuthorizedDelete(script: script, count: count)
+            }
+        }
+    }
+
+    private func beginAuthorizedDelete(script: String, count: Int) {
+        let launch: (Bool) -> Void = { authorize in
+            let freeBefore = SnapshotService.freeBytes()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = SnapshotService.runDeletion(
+                    script: script,
+                    deletedCount: count,
+                    authorize: authorize
+                )
+                DispatchQueue.main.async {
+                    self.handleDeleteResult(result, freeBefore: freeBefore)
+                }
+            }
+        }
+
+        // The password dialog has to be on the main thread. osascript brings up
+        // its own dialog and can run off the main thread.
+        if SnapshotService.prefersSessionAuthorization {
+            switch PrivilegedSession.shared.ensureAuthorized() {
             case .cancelled:
                 sessionAuthorized = SnapshotService.hasSessionAuthorization
                 status = .cancelled
             case .failed(let message):
                 sessionAuthorized = SnapshotService.hasSessionAuthorization
                 status = .failed(message)
+            case .success:
+                sessionAuthorized = true
+                launch(false)
             }
+        } else {
+            launch(true)
+        }
+    }
+
+    private func handleDeleteResult(_ result: SnapshotService.OpResult, freeBefore: Int64?) {
+        switch result {
+        case .success(let partial):
+            sessionAuthorized = SnapshotService.hasSessionAuthorization
+            status = .measuring
+            selection.removeAll()
+            let deletedCount = partial.deletedCount
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                let freeAfter = SnapshotService.freeBytesAfterDelete(baseline: freeBefore)
+                let listResult = SnapshotService.listSnapshots()
+                let summary = SnapshotService.volumeSummary()
+                let outcome = SnapshotService.makeOutcome(
+                    deletedCount: deletedCount,
+                    freeBefore: freeBefore,
+                    freeAfter: freeAfter
+                )
+                DispatchQueue.main.async {
+                    lastOutcome = outcome
+                    sessionAuthorized = SnapshotService.hasSessionAuthorization
+                    if let reclaimed = outcome.reclaimedBytes, reclaimed > 0 {
+                        sessionFreedBytes += reclaimed
+                    }
+                    volume = summary
+                    snapshots = listResult.snapshots
+                    if let message = listResult.errorMessage {
+                        status = .failed("\(outcome.successMessage). Refresh failed: \(message)")
+                    } else {
+                        status = .success(outcome.successMessage)
+                    }
+                }
+            }
+        case .cancelled:
+            sessionAuthorized = SnapshotService.hasSessionAuthorization
+            status = .cancelled
+        case .failed(let message):
+            sessionAuthorized = SnapshotService.hasSessionAuthorization
+            status = .failed(message)
         }
     }
 }
